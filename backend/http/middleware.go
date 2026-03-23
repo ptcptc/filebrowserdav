@@ -628,22 +628,120 @@ func withPermShareHelper(fn handleFunc) handleFunc {
 	})
 }
 
-// withBasicAuthHelper extracts Basic Auth credentials and uses the password as a JWT token
-// to authenticate the user. The username is ignored, and the password should be a JWT token.
+// withBasicAuthHelper extracts Basic Auth credentials and authenticates with username/password or JWT token
+// Supports two authentication methods:
+// 1. Username + Password (local user database) - NEW
+// 2. API Token (JWT token as password with empty username) - BACKWARD COMPATIBLE
 func withBasicAuthHelper(fn handleFunc) handleFunc {
 	return func(w http.ResponseWriter, r *http.Request, data *requestContext) (int, error) {
-		_, password, ok := r.BasicAuth()
+		username, password, ok := r.BasicAuth()
 		if !ok || password == "" {
 			// Return 401 - wrapHandlerBasicAuth will set WWW-Authenticate header
 			return http.StatusUnauthorized, fmt.Errorf("basic authentication required")
 		}
-		data.token = password
-		return withUserHelper(fn)(w, r, data)
+
+		// Try authentication method 1: Username + Password (NEW FEATURE)
+		if username != "" {
+			user, err := authenticateWebDAVWithUsernamePassword(username, password)
+			if err == nil {
+				data.user = user
+				logger.Debugf("WebDAV: User %s authenticated with username/password", username)
+				return fn(w, r, data)
+			}
+			logger.Debugf("WebDAV username/password auth failed for %s: %v", username, err)
+		}
+
+		// Try authentication method 2: API Token (BACKWARD COMPATIBILITY)
+		// If no username provided or password auth failed, treat password as token
+		user, err := authenticateWebDAVWithToken(password)
+		if err == nil {
+			data.user = user
+			logger.Debugf("WebDAV: User %s authenticated with API token", user.Username)
+			return fn(w, r, data)
+		}
+		logger.Debugf("WebDAV token auth failed: %v", err)
+
+		// Both methods failed
+		return http.StatusUnauthorized, fmt.Errorf("authentication failed")
 	}
 }
 
+// authenticateWebDAVWithUsernamePassword validates username and password for WebDAV
+// Uses bcrypt to securely compare passwords
+func authenticateWebDAVWithUsernamePassword(username, password string) (*users.User, error) {
+	// Don't authenticate if username is empty
+	if username == "" {
+		return nil, fmt.Errorf("username required")
+	}
+
+	// Retrieve user from database
+	user, err := store.Users.Get(username)
+	if err != nil {
+		// Always perform password check to prevent timing attacks
+		// Use InvalidPasswordHash for non-existent users
+		_ = utils.CheckPwd(password, utils.InvalidPasswordHash)
+		return nil, fmt.Errorf("user not found")
+	}
+
+	// Verify password using bcrypt
+	err = utils.CheckPwd(password, user.Password)
+	if err != nil {
+		return nil, fmt.Errorf("invalid password")
+	}
+
+	// Check if user has password-based login method enabled
+	if user.LoginMethod != users.LoginMethodPassword {
+		return nil, fmt.Errorf("user does not support password authentication")
+	}
+
+	return user, nil
+}
+
+// authenticateWebDAVWithToken validates JWT API token (BACKWARD COMPATIBILITY)
+// This allows existing WebDAV clients using API tokens to continue working
+func authenticateWebDAVWithToken(token string) (*users.User, error) {
+	if token == "" {
+		return nil, fmt.Errorf("token required")
+	}
+
+	keyFunc := func(t *jwt.Token) (interface{}, error) {
+		return []byte(config.Auth.Key), nil
+	}
+
+	var tk users.AuthToken
+	parsedToken, err := jwt.ParseWithClaims(token, &tk, keyFunc)
+	if err != nil || !parsedToken.Valid {
+		return nil, fmt.Errorf("invalid token")
+	}
+
+	// Check if token is revoked
+	if auth.IsRevokedApiToken(store.Access, token) {
+		return nil, fmt.Errorf("token is revoked")
+	}
+
+	// Verify token has a user association
+	if tk.BelongsTo == 0 {
+		userID, found := store.Access.GetUserIDFromToken(token)
+		if !found {
+			return nil, fmt.Errorf("token has no user association")
+		}
+		tk.BelongsTo = userID
+	}
+
+	if tk.BelongsTo <= 0 {
+		return nil, fmt.Errorf("invalid token: no user")
+	}
+
+	user, err := store.Users.Get(tk.BelongsTo)
+	if err != nil {
+		return nil, fmt.Errorf("user not found: %w", err)
+	}
+
+	return user, nil
+}
+
 // withBasicAuth returns an http.HandlerFunc for use with router.Handle.
-// It extracts Basic Auth credentials and uses the password as a JWT token to authenticate the user.
+// It extracts Basic Auth credentials and authenticates with username/password or JWT token.
 func withBasicAuth(fn handleFunc) http.HandlerFunc {
 	return wrapHandlerBasicAuth(withBasicAuthHelper(fn))
 }
